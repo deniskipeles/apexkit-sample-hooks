@@ -124,14 +124,14 @@ app.post("/", async (c) => {
   try {
     await ensureDefaultRootFolders();
 
-    const allFilesRes = await $db.records.list(COLLECTION, { 
+    const allFilesRes = await $db.records.list(COLLECTION, {
       per_page: 10000,
-      expand: "added_by" 
+      expand: "added_by"
     });
     const allRecords = allFilesRes.items || [];
-    
+
     const nodes = {};
-    
+
     const totalSizeBytes = allRecords
       .filter(r => r.data.is_file)
       .reduce((acc, curr) => acc + (Number(curr.data.metadata?.size) || 0), 0);
@@ -191,7 +191,7 @@ app.post("/", async (c) => {
     const mappedFiles = allRecords.map(f => {
       const profile = f.expand?.added_by;
       const creatorName = profile?.data?.metadata?.display_name || profile?.data?.metadata?.email || 'User';
-      
+
       return {
         id: String(f.id),
         path: normalizeFolderPath(f.data.path),
@@ -230,7 +230,7 @@ app.get("/files", async (c) => {
     await ensureDefaultRootFolders();
     const targetPath = normalizeFolderPath(c.req.query("path") || "/");
 
-    const allRes = await $db.records.list(COLLECTION, { 
+    const allRes = await $db.records.list(COLLECTION, {
       per_page: 10000,
       expand: "added_by"
     });
@@ -244,11 +244,11 @@ app.get("/files", async (c) => {
         return parent === targetPath;
       }
     });
-    
+
     const mapped = items.map(f => {
       const profile = f.expand?.added_by;
       const creatorName = profile?.data?.metadata?.display_name || profile?.data?.metadata?.email || 'User';
-      
+
       return {
         id: String(f.id),
         ...f.data,
@@ -283,7 +283,7 @@ app.get("/search", async (c) => {
       },
       limit: 100
     });
-    
+
     return c.json(res);
   } catch (e) {
     return c.json({ status: "error", message: e.message || String(e) }, 500);
@@ -311,14 +311,14 @@ app.post("/files", async (c) => {
     const reqAuthId = c.req.raw?.auth?.id || 1;
     let profileId = reqAuthId;
     try {
-      const profileRes = await $db.records.list("profiles", { 
-        filter: { user_id: reqAuthId }, 
-        limit: 1 
+      const profileRes = await $db.records.list("profiles", {
+        filter: { user_id: reqAuthId },
+        limit: 1
       });
       if (profileRes.items && profileRes.items.length > 0) {
         profileId = profileRes.items[0].id;
       }
-    } catch (_) {}
+    } catch (_) { }
 
     const fileSize = isFile ? (Number(body.metadata?.size) || 0) : 0;
     const metadata = {
@@ -341,12 +341,12 @@ app.post("/files", async (c) => {
     if (isFile && fileSize > 0) {
       await adjustAncestorFolderSizes(itemPath, fileSize);
     }
-    
-    return c.json({ 
-      id: String(created.id), 
-      ...data, 
-      created: new Date().toISOString(), 
-      updated: new Date().toISOString() 
+
+    return c.json({
+      id: String(created.id),
+      ...data,
+      created: new Date().toISOString(),
+      updated: new Date().toISOString()
     }, 201);
   } catch (e) {
     return c.json({ status: "error", message: e.message || String(e) }, 500);
@@ -358,7 +358,7 @@ app.post("/files", async (c) => {
 // ---------------------------------------------------------
 app.delete("/files/:id", async (c) => {
   const id = Number(c.req.param("id"));
-  
+
   try {
     const target = await $db.records.get(COLLECTION, id);
     if (!target) return c.json({ success: false, message: "Not found" }, 404);
@@ -371,7 +371,7 @@ app.delete("/files/:id", async (c) => {
 
       // [FIXED] Safely invoke file deletion if supported
       if (target.data.physical_file && typeof $files?.delete === 'function') {
-        await $files.delete(target.data.physical_file).catch(() => {});
+        await $files.delete(target.data.physical_file).catch(() => { });
       }
 
       // Delete record from database collection
@@ -384,7 +384,7 @@ app.delete("/files/:id", async (c) => {
     } else {
       // Deleting a Folder
       const folderPath = itemPath;
-      
+
       // Find all nested child files and subfolders
       const children = await $db.query({
         from: COLLECTION,
@@ -404,10 +404,10 @@ app.delete("/files/:id", async (c) => {
         if (child.is_file) {
           totalDeletedSize += (Number(child.metadata?.size) || 0);
           if (child.physical_file && typeof $files?.delete === 'function') {
-            await $files.delete(child.physical_file).catch(() => {});
+            await $files.delete(child.physical_file).catch(() => { });
           }
         }
-        await $db.records.delete(COLLECTION, child.id).catch(() => {});
+        await $db.records.delete(COLLECTION, child.id).catch(() => { });
       }
 
       // Delete the folder record itself
@@ -419,7 +419,7 @@ app.delete("/files/:id", async (c) => {
         await adjustAncestorFolderSizes(parentPath, -totalDeletedSize);
       }
     }
-    
+
     return c.json({ success: true });
   } catch (e) {
     return c.json({ status: "error", message: e.message || String(e) }, 500);
@@ -431,7 +431,7 @@ app.delete("/files/:id", async (c) => {
 // ---------------------------------------------------------
 app.patch("/files/:id", async (c) => {
   const id = Number(c.req.param("id"));
-  
+
   try {
     const body = await c.req.json();
     const target = await $db.records.get(COLLECTION, id);
@@ -473,7 +473,7 @@ app.patch("/files/:id", async (c) => {
 
       if (newFolderPath !== oldPath) {
         updateData.path = newFolderPath;
-        
+
         const oldParent = getParentFolderPath(oldPath);
         const newParent = getParentFolderPath(newFolderPath);
         if (oldParent !== newParent) {
@@ -523,7 +523,7 @@ app.get("/preview/:id", async (c) => {
     }, baseUrl);
 
     if (!target.data.preview || Object.keys(target.data.preview).length === 0) {
-      await $db.records.update(COLLECTION, id, { preview: previewData }).catch(() => {});
+      await $db.records.update(COLLECTION, id, { preview: previewData }).catch(() => { });
     }
 
     const profile = target.expand?.added_by;
@@ -565,6 +565,163 @@ app.get("/content/:id", async (c) => {
     return c.text(rawText, 200, { "Content-Type": `${mime}; charset=utf-8` });
   } catch (e) {
     return c.text(`Error: ${e.message}`, 500);
+  }
+});
+
+// ---------------------------------------------------------
+// 9. HLS Chunked Streaming Endpoint (GET /stream/:id/:filename)
+// ---------------------------------------------------------
+app.get("/stream/:id/:filename", async (c) => {
+  const id = Number(c.req.param("id"));
+  const filename = c.req.param("filename");
+
+  try {
+    const target = await $db.records.get(COLLECTION, id);
+    if (!target) return c.json({ error: "File not found" }, 404);
+
+    const storageFilename = target.data?.physical_file || target.data?.storage_filename;
+    if (!storageFilename) return c.text("No storage binary linked", 404);
+
+    const tmpDir = `processed_media/${storageFilename}`;
+    const requestedFilePath = `${tmpDir}/${filename}`;
+
+    const readBinary = async (path) => {
+      if (typeof $fs.readBytes === 'function') {
+        const b64 = await $fs.readBytes(path);
+        return $util.base64DecodeBuffer(b64);
+      }
+      throw new Error("Rust Binary Patch ($fs.readBytes) is required for HLS chunks");
+    };
+
+    // 1. If chunk or playlist already exists, serve immediately!
+    if (await $fs.exists(requestedFilePath)) {
+      const buffer = await readBinary(requestedFilePath);
+      const mime = filename.endsWith(".m3u8") ? "application/vnd.apple.mpegurl" : "video/mp2t";
+      return new Response(buffer, {
+        headers: {
+          "Content-Type": mime,
+          "Cache-Control": filename.endsWith(".m3u8") ? "no-cache" : "public, max-age=31536000",
+          "Access-Control-Allow-Origin": "*"
+        }
+      });
+    }
+
+    // 2. Transcode if requesting index.m3u8
+    if (filename === "index.m3u8") {
+      const lockKey = `transcode_lock:${storageFilename}`;
+
+      // ✅ FIX 1: Prevent duplicate concurrent FFmpeg instances
+      const isAlreadyTranscoding = await $cache.get(lockKey);
+      if (isAlreadyTranscoding) {
+        console.log(`[HLS] Transcode already running for ${storageFilename}, waiting for completion...`);
+        for (let i = 0; i < 40; i++) {
+          await $util.sleep(1000);
+          if (await $fs.exists(requestedFilePath)) {
+            const buffer = await readBinary(requestedFilePath);
+            return new Response(buffer, {
+              headers: {
+                "Content-Type": "application/vnd.apple.mpegurl",
+                "Cache-Control": "no-cache",
+                "Access-Control-Allow-Origin": "*"
+              }
+            });
+          }
+        }
+        return c.text("Transcoding in progress, please retry in a few seconds.", 503);
+      }
+
+      // Acquire lock for 3 minutes
+      await $cache.set(lockKey, "1", 180);
+
+      try {
+        console.log(`\n[HLS] Starting transcoding for: "${storageFilename}"`);
+        await $fs.mkdir(tmpDir);
+
+        const ext = storageFilename.split('.').pop() || 'bin';
+        const vfsInput = `${tmpDir}/input_media.${ext}`;
+
+        const base64Data = await $files.read(storageFilename);
+        await $fs.writeBytes(vfsInput, base64Data);
+
+        const isAudio = /\.(mp3|wav|ogg|m4a|aac|wma|flac)$/i.test(storageFilename);
+        console.log(`[HLS] Media category: ${isAudio ? "AUDIO ONLY" : "VIDEO"}`);
+
+        // ✅ Fast & Verbose FFmpeg HLS Arguments
+        const ffmpegArgs = isAudio ? [
+          "-y",
+          "-nostdin",
+          "-threads", "1",         // ✅ FIX: Force single-threaded to prevent WASI thread deadlocks
+          "-filter_threads", "1",  // ✅ FIX: Force single-threaded filters
+          "-loglevel", "info",
+          "-stats",
+          "-i", vfsInput,
+          "-vn",
+          "-c:a", "aac",
+          "-b:a", "128k",
+          "-ar", "44100",
+          "-ac", "2",
+          "-start_number", "0",
+          "-hls_time", "6",
+          "-hls_list_size", "0",
+          "-hls_segment_filename", `${tmpDir}/segment_%03d.ts`,
+          "-f", "hls",
+          `${tmpDir}/index.m3u8`
+        ] : [
+          "-y",
+          "-nostdin",
+          "-threads", "1",         // ✅ FIX: Force single-threaded
+          "-filter_threads", "1",
+          "-loglevel", "info",
+          "-stats",
+          "-i", vfsInput,
+          "-profile:v", "baseline",
+          "-level", "3.0",
+          "-s", "854x480",
+          "-c:a", "aac",
+          "-b:a", "128k",
+          "-start_number", "0",
+          "-hls_time", "6",
+          "-hls_list_size", "0",
+          "-hls_segment_filename", `${tmpDir}/segment_%03d.ts`,
+          "-f", "hls",
+          `${tmpDir}/index.m3u8`
+        ];
+
+        console.log(`[HLS] Executing FFmpeg WASI...`);
+        const t0 = Date.now();
+
+        await $wasm.runWasi("ffmpeg.wasm", ffmpegArgs, {
+          memoryMb: 512,
+          timeoutMs: 180000
+        });
+
+        console.log(`[HLS] Transcode completed in ${((Date.now() - t0) / 1000).toFixed(2)}s`);
+
+        // Clean up input file to save disk space
+        await $fs.delete(vfsInput).catch(() => { });
+
+        if (await $fs.exists(requestedFilePath)) {
+          const buffer = await readBinary(requestedFilePath);
+          return new Response(buffer, {
+            headers: {
+              "Content-Type": "application/vnd.apple.mpegurl",
+              "Cache-Control": "no-cache",
+              "Access-Control-Allow-Origin": "*"
+            }
+          });
+        } else {
+          return c.text("FFmpeg failed to generate playlist.", 500);
+        }
+      } finally {
+        // Release lock
+        await $cache.delete(lockKey);
+      }
+    }
+
+    return c.text("Segment not found", 404);
+  } catch (e) {
+    console.error(`[HLS Exception]`, e);
+    return c.text(`Stream error: ${e.message}`, 500);
   }
 });
 
