@@ -593,34 +593,33 @@ app.get("/stream/:id/:filename", async (c) => {
       throw new Error("Rust Binary Patch ($fs.readBytes) is required for HLS chunks");
     };
 
-    // 1. If chunk or playlist already exists, serve immediately!
+    // 1. Serve cached chunks instantly
     if (await $fs.exists(requestedFilePath)) {
       const buffer = await readBinary(requestedFilePath);
       const mime = filename.endsWith(".m3u8") ? "application/vnd.apple.mpegurl" : "video/mp2t";
       return new Response(buffer, {
-        headers: {
-          "Content-Type": mime,
+        headers: { 
+          "Content-Type": mime, 
           "Cache-Control": filename.endsWith(".m3u8") ? "no-cache" : "public, max-age=31536000",
           "Access-Control-Allow-Origin": "*"
         }
       });
     }
 
-    // 2. Transcode if requesting index.m3u8
+    // 2. Generate playlist & chunks
     if (filename === "index.m3u8") {
       const lockKey = `transcode_lock:${storageFilename}`;
-
-      // ✅ FIX 1: Prevent duplicate concurrent FFmpeg instances
+      
       const isAlreadyTranscoding = await $cache.get(lockKey);
       if (isAlreadyTranscoding) {
-        console.log(`[HLS] Transcode already running for ${storageFilename}, waiting for completion...`);
+        console.log(`[HLS] Transcode running for ${storageFilename}, waiting...`);
         for (let i = 0; i < 40; i++) {
           await $util.sleep(1000);
           if (await $fs.exists(requestedFilePath)) {
             const buffer = await readBinary(requestedFilePath);
             return new Response(buffer, {
-              headers: {
-                "Content-Type": "application/vnd.apple.mpegurl",
+              headers: { 
+                "Content-Type": "application/vnd.apple.mpegurl", 
                 "Cache-Control": "no-cache",
                 "Access-Control-Allow-Origin": "*"
               }
@@ -630,7 +629,6 @@ app.get("/stream/:id/:filename", async (c) => {
         return c.text("Transcoding in progress, please retry in a few seconds.", 503);
       }
 
-      // Acquire lock for 3 minutes
       await $cache.set(lockKey, "1", 180);
 
       try {
@@ -646,20 +644,17 @@ app.get("/stream/:id/:filename", async (c) => {
         const isAudio = /\.(mp3|wav|ogg|m4a|aac|wma|flac)$/i.test(storageFilename);
         console.log(`[HLS] Media category: ${isAudio ? "AUDIO ONLY" : "VIDEO"}`);
 
-        // ✅ Fast & Verbose FFmpeg HLS Arguments
         const ffmpegArgs = isAudio ? [
           "-y",
           "-nostdin",
-          "-threads", "1",         // ✅ FIX: Force single-threaded to prevent WASI thread deadlocks
-          "-filter_threads", "1",  // ✅ FIX: Force single-threaded filters
+          "-threads", "1",
+          "-filter_threads", "1",
           "-loglevel", "info",
           "-stats",
           "-i", vfsInput,
           "-vn",
           "-c:a", "aac",
           "-b:a", "128k",
-          "-ar", "44100",
-          "-ac", "2",
           "-start_number", "0",
           "-hls_time", "6",
           "-hls_list_size", "0",
@@ -669,7 +664,7 @@ app.get("/stream/:id/:filename", async (c) => {
         ] : [
           "-y",
           "-nostdin",
-          "-threads", "1",         // ✅ FIX: Force single-threaded
+          "-threads", "1",
           "-filter_threads", "1",
           "-loglevel", "info",
           "-stats",
@@ -690,21 +685,20 @@ app.get("/stream/:id/:filename", async (c) => {
         console.log(`[HLS] Executing FFmpeg WASI...`);
         const t0 = Date.now();
 
-        await $wasm.runWasi("ffmpeg.wasm", ffmpegArgs, {
-          memoryMb: 512,
-          timeoutMs: 180000
+        await $wasm.runWasi("ffmpeg.wasm", ffmpegArgs, { 
+          memoryMb: 512, 
+          timeoutMs: 180000 
         });
 
         console.log(`[HLS] Transcode completed in ${((Date.now() - t0) / 1000).toFixed(2)}s`);
 
-        // Clean up input file to save disk space
-        await $fs.delete(vfsInput).catch(() => { });
+        await $fs.delete(vfsInput).catch(() => {});
 
         if (await $fs.exists(requestedFilePath)) {
           const buffer = await readBinary(requestedFilePath);
           return new Response(buffer, {
-            headers: {
-              "Content-Type": "application/vnd.apple.mpegurl",
+            headers: { 
+              "Content-Type": "application/vnd.apple.mpegurl", 
               "Cache-Control": "no-cache",
               "Access-Control-Allow-Origin": "*"
             }
@@ -713,7 +707,6 @@ app.get("/stream/:id/:filename", async (c) => {
           return c.text("FFmpeg failed to generate playlist.", 500);
         }
       } finally {
-        // Release lock
         await $cache.delete(lockKey);
       }
     }
@@ -723,7 +716,7 @@ app.get("/stream/:id/:filename", async (c) => {
     console.error(`[HLS Exception]`, e);
     return c.text(`Stream error: ${e.message}`, 500);
   }
-});
+}); 
 
 export default async function (req) {
   return app.fetch(req);
