@@ -654,9 +654,10 @@ app.get("/stream/:id/:filename", async (c) => {
           "-i", vfsInput,
           "-vn",
           "-c:a", "aac",
-          "-b:a", "128k",
+          "-b:a", "48k",          // ✅ Reduced from 128k -> cuts size by ~65%
+          "-ar", "22050",         // Match source sample rate (prevents upsampling)
           "-start_number", "0",
-          "-hls_time", "6",
+          "-hls_time", "10",       // ✅ 10s chunks reduce total number of files and TS overhead
           "-hls_list_size", "0",
           "-hls_segment_filename", `${tmpDir}/segment_%03d.ts`,
           "-f", "hls",
@@ -673,7 +674,7 @@ app.get("/stream/:id/:filename", async (c) => {
           "-level", "3.0",
           "-s", "854x480",
           "-c:a", "aac",
-          "-b:a", "128k",
+          "-b:a", "96k",
           "-start_number", "0",
           "-hls_time", "6",
           "-hls_list_size", "0",
