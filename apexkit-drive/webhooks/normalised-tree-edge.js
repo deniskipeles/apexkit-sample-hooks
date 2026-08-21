@@ -26,9 +26,6 @@ const DEFAULT_ROOT_FOLDERS = [
 
 let isSeeded = false;
 
-/**
- * Ensures standard root folders exist in drive_items database table
- */
 async function ensureDefaultRootFolders() {
   if (isSeeded) return;
   try {
@@ -48,7 +45,7 @@ async function ensureDefaultRootFolders() {
           physical_file: null,
           metadata: { color: "emerald", icon: df.icon, size: 0 },
           configurations: { defaultFolder: true },
-          added_by: 1
+          added_by: [1]
         });
       }
     }
@@ -104,7 +101,7 @@ async function adjustAncestorFolderSizes(filePath, deltaSize) {
         const currentSize = Number(meta.size) || 0;
         const newSize = Math.max(0, currentSize + deltaSize);
 
-        await $db.records.update(COLLECTION, folder.id, {
+        await $db.records.update(COLLECTION, Number(folder.id), {
           metadata: {
             ...meta,
             size: newSize
@@ -114,6 +111,69 @@ async function adjustAncestorFolderSizes(filePath, deltaSize) {
     } catch (err) {
       console.error(`[SizeUpdate] Error adjusting size for folder ${fPath}:`, err);
     }
+  }
+}
+
+/**
+ * Extracts creator information from expanded profile relation
+ */
+function getCreatorInfo(record) {
+  let profile = record.expand?.added_by;
+  if (Array.isArray(profile) && profile.length > 0) {
+    profile = profile[0];
+  }
+  const meta = profile?.data?.metadata || profile?.metadata || {};
+  return {
+    name: meta.display_name || meta.name || meta.email || 'User',
+    email: meta.email || '',
+    role: meta.role || 'Member',
+    avatar: meta.avatar || null,
+    department: meta.department || ''
+  };
+}
+
+// --- REFERENCE COUNTED SAFE PHYSICAL & HLS CLEANUP ---
+
+async function safelyDeletePhysicalFile(physicalFile, excludeIds = []) {
+  if (!physicalFile) return;
+
+  try {
+    const excludeSet = new Set(excludeIds.map(Number));
+
+    const referencingRecords = await $db.query({
+      from: COLLECTION,
+      where: {
+        $or: [
+          { physical_file: physicalFile },
+          { "metadata.storage_filename": physicalFile }
+        ]
+      },
+      limit: 50
+    });
+
+    const otherRefs = (referencingRecords || []).filter(r => !excludeSet.has(Number(r.id)));
+
+    if (otherRefs.length === 0) {
+      if (typeof $files?.delete === 'function') {
+        await $files.delete(physicalFile).catch(() => {});
+      }
+
+      const hlsDir = `processed_media/${physicalFile}`;
+      if (typeof $fs?.exists === 'function' && typeof $fs?.delete === 'function') {
+        const hasHls = await $fs.exists(hlsDir).catch(() => false);
+        if (hasHls) {
+          await $fs.delete(hlsDir).catch((err) => {
+            console.warn(`[Delete] Failed to delete HLS directory ${hlsDir}:`, err);
+          });
+        }
+      }
+
+      if (typeof $cache?.delete === 'function') {
+        await $cache.delete(`transcode_lock:${physicalFile}`).catch(() => {});
+      }
+    }
+  } catch (err) {
+    console.warn(`[Delete] Error checking physical/HLS file refs for ${physicalFile}:`, err);
   }
 }
 
@@ -136,7 +196,6 @@ app.post("/", async (c) => {
       .filter(r => r.data.is_file)
       .reduce((acc, curr) => acc + (Number(curr.data.metadata?.size) || 0), 0);
 
-    // 1. Root Node (This PC)
     nodes['/'] = {
       id: 'node-root',
       name: 'This PC',
@@ -151,12 +210,10 @@ app.post("/", async (c) => {
       updated: new Date().toISOString(),
     };
 
-    // 2. Folder Nodes
     allRecords.filter(f => !f.data.is_file).forEach(folder => {
       const folderFullPath = normalizeFolderPath(folder.data.path);
       const parentPath = getParentFolderPath(folderFullPath) || '/';
-      const profile = folder.expand?.added_by;
-      const creatorName = profile?.data?.metadata?.display_name || profile?.data?.metadata?.email || 'System';
+      const creatorInfo = getCreatorInfo(folder);
 
       nodes[folderFullPath] = {
         id: String(folder.id),
@@ -167,13 +224,12 @@ app.post("/", async (c) => {
         children_paths: [],
         metadata: folder.data.metadata || { size: 0 },
         configurations: folder.data.configurations || {},
-        added_by: creatorName,
+        added_by: creatorInfo.name,
         created: folder.created,
         updated: folder.updated,
       };
     });
 
-    // 3. Link parent-child references
     Object.values(nodes).forEach(node => {
       if (node.parent_path && nodes[node.parent_path]) {
         if (!nodes[node.parent_path].children_paths) {
@@ -189,8 +245,7 @@ app.post("/", async (c) => {
     const totalFolders = allRecords.filter(f => !f.data.is_file).length;
 
     const mappedFiles = allRecords.map(f => {
-      const profile = f.expand?.added_by;
-      const creatorName = profile?.data?.metadata?.display_name || profile?.data?.metadata?.email || 'User';
+      const creatorInfo = getCreatorInfo(f);
 
       return {
         id: String(f.id),
@@ -200,7 +255,7 @@ app.post("/", async (c) => {
         physical_file: f.data.physical_file || null,
         metadata: f.data.metadata || {},
         configurations: f.data.configurations || {},
-        added_by: creatorName,
+        added_by: creatorInfo.name,
         created: f.created,
         updated: f.updated
       };
@@ -246,14 +301,13 @@ app.get("/files", async (c) => {
     });
 
     const mapped = items.map(f => {
-      const profile = f.expand?.added_by;
-      const creatorName = profile?.data?.metadata?.display_name || profile?.data?.metadata?.email || 'User';
+      const creatorInfo = getCreatorInfo(f);
 
       return {
         id: String(f.id),
         ...f.data,
         path: normalizeFolderPath(f.data.path),
-        added_by: creatorName,
+        added_by: creatorInfo.name,
         created: f.created,
         updated: f.updated
       };
@@ -309,14 +363,26 @@ app.post("/files", async (c) => {
     }
 
     const reqAuthId = c.req.raw?.auth?.id || 1;
-    let profileId = reqAuthId;
+    let profileId = null;
+
     try {
       const profileRes = await $db.records.list("profiles", {
         filter: { user_id: reqAuthId },
         limit: 1
       });
       if (profileRes.items && profileRes.items.length > 0) {
-        profileId = profileRes.items[0].id;
+        profileId = Number(profileRes.items[0].id);
+      } else {
+        const newProf = await $db.records.create("profiles", {
+          user_id: reqAuthId,
+          metadata: {
+            display_name: c.req.raw?.auth?.email?.split('@')[0] || "User",
+            email: c.req.raw?.auth?.email || "user@example.com",
+            role: c.req.raw?.auth?.role || "user",
+            created_at: new Date().toISOString()
+          }
+        });
+        profileId = Number(newProf.id);
       }
     } catch (_) { }
 
@@ -333,7 +399,7 @@ app.post("/files", async (c) => {
       physical_file: body.physical_file || null,
       metadata: metadata,
       configurations: body.configurations || {},
-      added_by: profileId
+      added_by: profileId ? [profileId] : []
     };
 
     const created = await $db.records.create(COLLECTION, data);
@@ -358,6 +424,9 @@ app.post("/files", async (c) => {
 // ---------------------------------------------------------
 app.delete("/files/:id", async (c) => {
   const id = Number(c.req.param("id"));
+  if (isNaN(id)) {
+    return c.json({ success: false, message: "Invalid ID" }, 400);
+  }
 
   try {
     const target = await $db.records.get(COLLECTION, id);
@@ -368,24 +437,20 @@ app.delete("/files/:id", async (c) => {
 
     if (isFile) {
       const fileSize = Number(target.data.metadata?.size) || 0;
+      const physicalFile = target.data.physical_file || target.data.metadata?.storage_filename;
 
-      // [FIXED] Safely invoke file deletion if supported
-      if (target.data.physical_file && typeof $files?.delete === 'function') {
-        await $files.delete(target.data.physical_file).catch(() => { });
+      if (physicalFile) {
+        await safelyDeletePhysicalFile(physicalFile, [id]);
       }
 
-      // Delete record from database collection
       await $db.records.delete(COLLECTION, id);
 
-      // Subtract size from ancestor folders
       if (fileSize > 0) {
         await adjustAncestorFolderSizes(itemPath, -fileSize);
       }
     } else {
-      // Deleting a Folder
       const folderPath = itemPath;
 
-      // Find all nested child files and subfolders
       const children = await $db.query({
         from: COLLECTION,
         where: {
@@ -397,23 +462,30 @@ app.delete("/files/:id", async (c) => {
         limit: 10000
       });
 
+      const allDeletingIds = [id, ...(children || []).map(child => Number(child.id))];
       let totalDeletedSize = 0;
+      const physicalFilesToCheck = new Set();
 
-      for (const child of children) {
-        if (child.id === id) continue;
+      for (const child of (children || [])) {
+        if (Number(child.id) === id) continue;
+
         if (child.is_file) {
           totalDeletedSize += (Number(child.metadata?.size) || 0);
-          if (child.physical_file && typeof $files?.delete === 'function') {
-            await $files.delete(child.physical_file).catch(() => { });
+          const pFile = child.physical_file || child.metadata?.storage_filename;
+          if (pFile) {
+            physicalFilesToCheck.add(pFile);
           }
         }
-        await $db.records.delete(COLLECTION, child.id).catch(() => { });
+
+        await $db.records.delete(COLLECTION, Number(child.id)).catch(() => {});
       }
 
-      // Delete the folder record itself
       await $db.records.delete(COLLECTION, id);
 
-      // Subtract total deleted folder content size from parent ancestors
+      for (const pFile of physicalFilesToCheck) {
+        await safelyDeletePhysicalFile(pFile, allDeletingIds);
+      }
+
       const parentPath = getParentFolderPath(folderPath);
       if (parentPath && totalDeletedSize > 0) {
         await adjustAncestorFolderSizes(parentPath, -totalDeletedSize);
@@ -427,55 +499,121 @@ app.delete("/files/:id", async (c) => {
 });
 
 // ---------------------------------------------------------
-// 6. Rename/Move (PATCH /files/:id)
+// 6. Rename/Move (PATCH /files/:id) - Hardened & Poison-Proof
 // ---------------------------------------------------------
 app.patch("/files/:id", async (c) => {
   const id = Number(c.req.param("id"));
+  if (isNaN(id)) {
+    return c.json({ success: false, message: "Invalid ID parameter" }, 400);
+  }
 
   try {
     const body = await c.req.json();
     const target = await $db.records.get(COLLECTION, id);
-    if (!target) return c.json({ error: "File not found" }, 404);
+    if (!target) return c.json({ success: false, message: "Item not found" }, 404);
 
     const isFile = target.data.is_file;
     const oldName = target.data.file;
     const oldPath = normalizeFolderPath(target.data.path);
-    const newName = body.file;
+    const newName = body.file ? body.file.trim() : undefined;
     const newPathRaw = body.path;
 
+    if (!isFile && oldPath === '/' && (newName !== undefined || newPathRaw !== undefined)) {
+      return c.json({ success: false, message: "Cannot rename or move the root directory" }, 400);
+    }
+
     const updateData = {};
-    if (newName !== undefined) updateData.file = newName;
     if (body.configurations !== undefined) updateData.configurations = body.configurations;
     if (body.metadata !== undefined) updateData.metadata = body.metadata;
 
     if (isFile) {
-      if (newPathRaw !== undefined) {
-        const newPath = normalizeFolderPath(newPathRaw);
-        if (newPath !== oldPath) {
-          updateData.path = newPath;
-          const fileSize = Number(target.data.metadata?.size) || 0;
-          if (fileSize > 0) {
-            await adjustAncestorFolderSizes(oldPath, -fileSize);
-            await adjustAncestorFolderSizes(newPath, fileSize);
-          }
+      const finalFileName = newName || oldName;
+      const targetDirectory = newPathRaw !== undefined ? normalizeFolderPath(newPathRaw) : oldPath;
+
+      if (finalFileName !== oldName || targetDirectory !== oldPath) {
+        const existingCollision = await $db.query({
+          from: COLLECTION,
+          where: {
+            path: targetDirectory,
+            file: finalFileName,
+            is_file: true
+          },
+          limit: 1
+        });
+
+        if (existingCollision.length > 0 && Number(existingCollision[0].id) !== id) {
+          return c.json({ 
+            success: false, 
+            message: `A file named '${finalFileName}' already exists in '${targetDirectory}'` 
+          }, 409);
         }
       }
+
+      if (newName !== undefined) updateData.file = finalFileName;
+
+      if (targetDirectory !== oldPath) {
+        updateData.path = targetDirectory;
+        const fileSize = Number(target.data.metadata?.size) || 0;
+        if (fileSize > 0) {
+          await adjustAncestorFolderSizes(oldPath, -fileSize);
+          await adjustAncestorFolderSizes(targetDirectory, fileSize);
+        }
+      }
+
       const updated = await $db.records.update(COLLECTION, id, updateData);
       return c.json({ id: String(updated.id), ...updated.data, updated: updated.updated });
     } else {
-      let newFolderPath = oldPath;
+      const finalFolderName = newName || oldName;
+      const currentOldFolderFullPath = oldPath;
+
+      let newFolderFullPath = currentOldFolderFullPath;
+
       if (newPathRaw !== undefined || newName !== undefined) {
-        const parentPath = newPathRaw !== undefined ? normalizeFolderPath(newPathRaw) : getParentFolderPath(oldPath) || '/';
-        const finalFolderName = newName || oldName;
-        newFolderPath = parentPath === '/' ? `/${finalFolderName}/` : `${parentPath}${finalFolderName}/`;
-        newFolderPath = normalizeFolderPath(newFolderPath);
+        const parentPath = newPathRaw !== undefined 
+          ? normalizeFolderPath(newPathRaw) 
+          : (getParentFolderPath(currentOldFolderFullPath) || '/');
+
+        newFolderFullPath = parentPath === '/' 
+          ? `/${finalFolderName}/` 
+          : `${parentPath}${finalFolderName}/`;
+        newFolderFullPath = normalizeFolderPath(newFolderFullPath);
       }
 
-      if (newFolderPath !== oldPath) {
-        updateData.path = newFolderPath;
+      if (newFolderFullPath !== currentOldFolderFullPath) {
+        if (
+          newFolderFullPath === currentOldFolderFullPath || 
+          newFolderFullPath.startsWith(currentOldFolderFullPath)
+        ) {
+          return c.json({ 
+            success: false, 
+            message: `Cannot move folder '${oldName}' into its own subfolder` 
+          }, 400);
+        }
 
-        const oldParent = getParentFolderPath(oldPath);
-        const newParent = getParentFolderPath(newFolderPath);
+        const existingFolder = await $db.query({
+          from: COLLECTION,
+          where: {
+            path: newFolderFullPath,
+            is_file: false
+          },
+          limit: 1
+        });
+
+        if (existingFolder.length > 0 && Number(existingFolder[0].id) !== id) {
+          return c.json({ 
+            success: false, 
+            message: `A folder with path '${newFolderFullPath}' already exists` 
+          }, 409);
+        }
+      }
+
+      if (newName !== undefined) updateData.file = finalFolderName;
+
+      if (newFolderFullPath !== currentOldFolderFullPath) {
+        updateData.path = newFolderFullPath;
+
+        const oldParent = getParentFolderPath(currentOldFolderFullPath);
+        const newParent = getParentFolderPath(newFolderFullPath);
         if (oldParent !== newParent) {
           const folderSize = Number(target.data.metadata?.size) || 0;
           if (folderSize > 0) {
@@ -487,14 +625,20 @@ app.patch("/files/:id", async (c) => {
         const children = await $db.query({
           from: COLLECTION,
           where: {
-            path: { $like: `${oldPath}%` }
+            path: { $like: `${currentOldFolderFullPath}%` }
           },
           limit: 10000
         });
 
         for (const child of children) {
-          const updatedChildPath = child.path.replace(oldPath, newFolderPath);
-          await $db.records.update(COLLECTION, child.id, { path: updatedChildPath });
+          if (Number(child.id) === id) continue;
+
+          const childPath = normalizeFolderPath(child.path);
+          if (childPath.startsWith(currentOldFolderFullPath)) {
+            const childRelativePath = childPath.substring(currentOldFolderFullPath.length);
+            const updatedChildPath = normalizeFolderPath(`${newFolderFullPath}${childRelativePath}`);
+            await $db.records.update(COLLECTION, Number(child.id), { path: updatedChildPath });
+          }
         }
       }
 
@@ -507,7 +651,286 @@ app.patch("/files/:id", async (c) => {
 });
 
 // ---------------------------------------------------------
-// 7. Preview Endpoint (GET /preview/:id)
+// 7. Bulk Operations (POST /operations/move & /operations/copy)
+// ---------------------------------------------------------
+
+app.post("/operations/move", async (c) => {
+  try {
+    const { itemIds, targetPath } = await c.req.json();
+    const normTarget = normalizeFolderPath(targetPath);
+    let success = 0;
+    let failed = 0;
+    let errors = [];
+
+    let sizeDeltas = {}; 
+
+    for (const rawId of (itemIds || [])) {
+      const id = Number(rawId);
+      if (isNaN(id)) {
+        failed++;
+        errors.push(`Invalid ID: ${rawId}`);
+        continue;
+      }
+
+      try {
+        const target = await $db.records.get(COLLECTION, id);
+        if (!target) { 
+          failed++; 
+          errors.push(`Item ${id} not found`);
+          continue; 
+        }
+
+        const isFile = target.data.is_file;
+        const oldPath = normalizeFolderPath(target.data.path);
+        
+        if (oldPath === normTarget) {
+           success++;
+           continue;
+        }
+
+        const itemSize = Number(target.data.metadata?.size) || 0;
+
+        if (isFile) {
+          await $db.records.update(COLLECTION, id, { path: normTarget });
+        } else {
+          const folderName = target.data.file;
+          const oldFolderPath = normalizeFolderPath(oldPath === '/' ? `/${folderName}/` : `${oldPath}${folderName}/`);
+          const newFolderPath = normalizeFolderPath(normTarget === '/' ? `/${folderName}/` : `${normTarget}${folderName}/`);
+
+          if (normTarget === oldFolderPath || normTarget.startsWith(oldFolderPath)) {
+             throw new Error(`Cannot move folder '${folderName}' into itself`);
+          }
+
+          await $db.records.update(COLLECTION, id, { path: normTarget });
+
+          const children = await $db.query({
+            from: COLLECTION,
+            where: { path: { $like: `${oldFolderPath}%` } },
+            limit: 10000
+          });
+
+          for (const child of children) {
+            const childRelativePath = child.path.substring(oldFolderPath.length);
+            const childNewPath = normalizeFolderPath(`${newFolderPath}${childRelativePath}`);
+            await $db.records.update(COLLECTION, Number(child.id), { path: childNewPath });
+          }
+        }
+
+        if (itemSize > 0) {
+           sizeDeltas[oldPath] = (sizeDeltas[oldPath] || 0) - itemSize;
+           sizeDeltas[normTarget] = (sizeDeltas[normTarget] || 0) + itemSize;
+        }
+
+        success++;
+      } catch (err) {
+        failed++;
+        errors.push(err.message || String(err));
+      }
+    }
+
+    for (const [fPath, delta] of Object.entries(sizeDeltas)) {
+       if (delta !== 0) {
+          await adjustAncestorFolderSizes(fPath, delta);
+       }
+    }
+
+    return c.json({ success, failed, errors });
+  } catch (e) {
+    return c.json({ status: "error", message: e.message || String(e) }, 500);
+  }
+});
+
+app.post("/operations/copy", async (c) => {
+  try {
+    const { itemIds, targetPath } = await c.req.json();
+    const normTarget = normalizeFolderPath(targetPath);
+    
+    let success = 0;
+    let failed = 0;
+    let errors = [];
+    let totalSizeAddedToTarget = 0;
+
+    for (const rawId of (itemIds || [])) {
+      const id = Number(rawId);
+      if (isNaN(id)) {
+        failed++;
+        errors.push(`Invalid ID: ${rawId}`);
+        continue;
+      }
+
+      try {
+        const target = await $db.records.get(COLLECTION, id);
+        if (!target) {
+           failed++;
+           errors.push(`Item ${id} not found`);
+           continue;
+        }
+
+        const isFile = target.data.is_file;
+        const originalName = target.data.file;
+        const oldPath = normalizeFolderPath(target.data.path);
+        
+        let newName = originalName;
+        if (oldPath === normTarget) {
+          const nameParts = originalName.split('.');
+          if (nameParts.length > 1 && isFile) {
+            const ext = nameParts.pop();
+            newName = `${nameParts.join('.')} - Copy.${ext}`;
+          } else {
+            newName = `${originalName} - Copy`;
+          }
+        }
+
+        const newRecord = await $db.records.create(COLLECTION, {
+          path: normTarget,
+          is_file: isFile,
+          file: newName,
+          physical_file: target.data.physical_file,
+          metadata: target.data.metadata,
+          configurations: target.data.configurations,
+          added_by: target.data.added_by
+        });
+
+        let itemTotalSize = isFile ? (Number(target.data.metadata?.size) || 0) : 0;
+
+        if (!isFile) {
+          const oldFolderPath = normalizeFolderPath(oldPath === '/' ? `/${originalName}/` : `${oldPath}${originalName}/`);
+          const newFolderPath = normalizeFolderPath(normTarget === '/' ? `/${newName}/` : `${normTarget}${newName}/`);
+
+          const children = await $db.query({
+            from: COLLECTION,
+            where: { path: { $like: `${oldFolderPath}%` } },
+            limit: 10000
+          });
+
+          for (const child of children) {
+            if (Number(child.id) === id) continue;
+            const childRelativePath = child.path.substring(oldFolderPath.length);
+            const childNewPath = normalizeFolderPath(`${newFolderPath}${childRelativePath}`);
+            
+            await $db.records.create(COLLECTION, {
+              path: childNewPath,
+              is_file: child.is_file,
+              file: child.file,
+              physical_file: child.physical_file,
+              metadata: child.metadata,
+              configurations: child.configurations,
+              added_by: child.added_by
+            });
+            
+            if (child.is_file) {
+              itemTotalSize += (Number(child.metadata?.size) || 0);
+            }
+          }
+          
+          const meta = newRecord.data.metadata || {};
+          meta.size = itemTotalSize;
+          await $db.records.update(COLLECTION, Number(newRecord.id), { metadata: meta });
+        }
+
+        totalSizeAddedToTarget += itemTotalSize;
+        success++;
+      } catch (err) {
+        failed++;
+        errors.push(err.message || String(err));
+      }
+    }
+
+    if (totalSizeAddedToTarget > 0) {
+      await adjustAncestorFolderSizes(normTarget, totalSizeAddedToTarget);
+    }
+
+    return c.json({ success, failed, errors });
+  } catch (e) {
+    return c.json({ status: "error", message: e.message || String(e) }, 500);
+  }
+});
+
+// ---------------------------------------------------------
+// 8. User Profile Management (GET /profile & PATCH /profile) 
+// ---------------------------------------------------------
+app.get("/profile", async (c) => {
+  try {
+    const reqAuthId = c.req.raw?.auth?.id || 1;
+    const profileRes = await $db.records.list("profiles", {
+      filter: { user_id: reqAuthId },
+      limit: 1
+    });
+
+    if (profileRes.items && profileRes.items.length > 0) {
+      const p = profileRes.items[0];
+      return c.json({
+        id: String(p.id),
+        user_id: p.data.user_id,
+        metadata: p.data.metadata || {}
+      });
+    }
+
+    return c.json({
+      id: "default",
+      user_id: reqAuthId,
+      metadata: {
+        display_name: c.req.raw?.auth?.email?.split('@')[0] || "User",
+        email: c.req.raw?.auth?.email || "",
+        role: c.req.raw?.auth?.role || "user"
+      }
+    });
+  } catch (e) {
+    return c.json({ status: "error", message: e.message || String(e) }, 500);
+  }
+});
+
+app.patch("/profile", async (c) => {
+  try {
+    const reqAuthId = c.req.raw?.auth?.id || 1;
+    const body = await c.req.json();
+    const incomingMetadata = body.metadata || {};
+
+    const profileRes = await $db.records.list("profiles", {
+      filter: { user_id: reqAuthId },
+      limit: 1
+    });
+
+    if (profileRes.items && profileRes.items.length > 0) {
+      const p = profileRes.items[0];
+      const mergedMetadata = {
+        ...(p.data.metadata || {}),
+        ...incomingMetadata,
+        updated_at: new Date().toISOString()
+      };
+
+      const updated = await $db.records.update("profiles", Number(p.id), {
+        metadata: mergedMetadata
+      });
+
+      return c.json({
+        id: String(updated.id),
+        user_id: updated.data.user_id,
+        metadata: updated.data.metadata
+      });
+    } else {
+      const created = await $db.records.create("profiles", {
+        user_id: reqAuthId,
+        metadata: {
+          ...incomingMetadata,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        }
+      });
+
+      return c.json({
+        id: String(created.id),
+        user_id: reqAuthId,
+        metadata: incomingMetadata
+      }, 201);
+    }
+  } catch (e) {
+    return c.json({ status: "error", message: e.message || String(e) }, 500);
+  }
+});
+
+// ---------------------------------------------------------
+// 9. Preview Endpoint (GET /preview/:id)
 // ---------------------------------------------------------
 app.get("/preview/:id", async (c) => {
   const id = Number(c.req.param("id"));
@@ -526,8 +949,7 @@ app.get("/preview/:id", async (c) => {
       await $db.records.update(COLLECTION, id, { preview: previewData }).catch(() => { });
     }
 
-    const profile = target.expand?.added_by;
-    const creatorName = profile?.data?.metadata?.display_name || profile?.data?.metadata?.email || "User";
+    const creatorInfo = getCreatorInfo(target);
 
     return c.json({
       id: String(target.id),
@@ -537,7 +959,7 @@ app.get("/preview/:id", async (c) => {
       metadata: target.data.metadata || {},
       configurations: target.data.configurations || {},
       preview: previewData,
-      added_by: creatorName,
+      added_by: creatorInfo.name,
       created: target.created,
       updated: target.updated
     });
@@ -547,7 +969,7 @@ app.get("/preview/:id", async (c) => {
 });
 
 // ---------------------------------------------------------
-// 8. Raw File Content Endpoint (GET /content/:id)
+// 10. Raw File Content Endpoint (GET /content/:id)
 // ---------------------------------------------------------
 app.get("/content/:id", async (c) => {
   const id = Number(c.req.param("id"));
@@ -569,7 +991,7 @@ app.get("/content/:id", async (c) => {
 });
 
 // ---------------------------------------------------------
-// 9. HLS Chunked Streaming Endpoint (GET /stream/:id/:filename)
+// 11. HLS Chunked Streaming Endpoint (GET /stream/:id/:filename)
 // ---------------------------------------------------------
 app.get("/stream/:id/:filename", async (c) => {
   const id = Number(c.req.param("id"));
@@ -593,7 +1015,6 @@ app.get("/stream/:id/:filename", async (c) => {
       throw new Error("Rust Binary Patch ($fs.readBytes) is required for HLS chunks");
     };
 
-    // 1. Serve cached chunks instantly
     if (await $fs.exists(requestedFilePath)) {
       const buffer = await readBinary(requestedFilePath);
       const mime = filename.endsWith(".m3u8") ? "application/vnd.apple.mpegurl" : "video/mp2t";
@@ -606,7 +1027,6 @@ app.get("/stream/:id/:filename", async (c) => {
       });
     }
 
-    // 2. Generate playlist & chunks
     if (filename === "index.m3u8") {
       const lockKey = `transcode_lock:${storageFilename}`;
       
@@ -654,10 +1074,10 @@ app.get("/stream/:id/:filename", async (c) => {
           "-i", vfsInput,
           "-vn",
           "-c:a", "aac",
-          "-b:a", "48k",          // ✅ Reduced from 128k -> cuts size by ~65%
-          "-ar", "22050",         // Match source sample rate (prevents upsampling)
+          "-b:a", "48k",
+          "-ar", "22050",
           "-start_number", "0",
-          "-hls_time", "10",       // ✅ 10s chunks reduce total number of files and TS overhead
+          "-hls_time", "10",
           "-hls_list_size", "0",
           "-hls_segment_filename", `${tmpDir}/segment_%03d.ts`,
           "-f", "hls",
@@ -683,9 +1103,7 @@ app.get("/stream/:id/:filename", async (c) => {
           `${tmpDir}/index.m3u8`
         ];
 
-        console.log(`[HLS] Executing FFmpeg WASI...`);
         const t0 = Date.now();
-
         await $wasm.runWasi("ffmpeg.wasm", ffmpegArgs, { 
           memoryMb: 512, 
           timeoutMs: 180000 
@@ -718,6 +1136,177 @@ app.get("/stream/:id/:filename", async (c) => {
     return c.text(`Stream error: ${e.message}`, 500);
   }
 }); 
+
+// ---------------------------------------------------------
+// 12. Create / Update Share Link (POST /shares)
+// ---------------------------------------------------------
+app.post("/shares", async (c) => {
+  try {
+    const body = await c.req.json();
+    const item_id = body.item_id;
+    const folder_path = body.folder_path;
+    const access_level = body.access_level || "anyone_view";
+    const expires_at = body.expires_at;
+    const password = body.password;
+    let token = body.token;
+    
+    let password_hash = undefined;
+    if (password && password.trim().length > 0) {
+      password_hash = $util.hash(password.trim(), "sha256");
+    }
+
+    // Safely construct search filter
+    let searchFilter = {};
+    if (item_id !== undefined && item_id !== null) {
+      searchFilter = { item_id: Number(item_id) };
+    } else if (folder_path !== undefined && folder_path !== null) {
+      searchFilter = { folder_path: String(folder_path) };
+    } else {
+      return c.json({ success: false, message: "Missing item_id or folder_path" }, 400);
+    }
+
+    const existing = await $db.query({
+      from: "drive_shares",
+      where: searchFilter,
+      limit: 1
+    });
+
+    if (existing && existing.length > 0) {
+      const shareRecord = existing[0];
+      token = shareRecord.data.token; // Access via .data
+      
+      const updateData = { access_level };
+      if (expires_at !== undefined && expires_at !== null) updateData.expires_at = expires_at;
+      if (password_hash !== undefined) updateData.password_hash = password_hash;
+
+      await $db.records.update("drive_shares", Number(shareRecord.id), updateData);
+    } else {
+      token = token || $util.randomHex(12);
+      
+      const createData = { token, access_level };
+      // Strip out nulls entirely to prevent serialization panics in Rust
+      if (item_id !== undefined && item_id !== null) createData.item_id = Number(item_id);
+      if (folder_path !== undefined && folder_path !== null) createData.folder_path = String(folder_path);
+      if (expires_at !== undefined && expires_at !== null) createData.expires_at = expires_at;
+      if (password_hash !== undefined) createData.password_hash = password_hash;
+
+      await $db.records.create("drive_shares", createData);
+    }
+
+    return c.json({ success: true, token });
+  } catch (e) {
+    return c.json({ status: "error", message: e.message || String(e) }, 500);
+  }
+});
+
+// ---------------------------------------------------------
+// 13. Resolve Share Link Publicly (GET /shares/:token)
+// ---------------------------------------------------------
+app.get("/shares/:token", async (c) => {
+  const token = c.req.param("token");
+  const providedPassword = c.req.query("pw");
+
+  try {
+    const shares = await $db.query({
+      from: "drive_shares",
+      where: { token },
+      limit: 1
+    });
+
+    if (!shares || shares.length === 0) {
+      return c.json({ error: "Share link not found or deleted." }, 404);
+    }
+    
+    const shareRecord = shares[0];
+    const shareData = shareRecord.data; // Access via .data
+
+    if (shareData.expires_at && new Date(shareData.expires_at) < new Date()) {
+      return c.json({ error: "This share link has expired." }, 410);
+    }
+
+    if (shareData.password_hash) {
+      if (!providedPassword) {
+        return c.json({ requirePassword: true }, 401);
+      }
+      const hashedProvided = $util.hash(providedPassword, "sha256");
+      if (hashedProvided !== shareData.password_hash) {
+        return c.json({ requirePassword: true, error: "Incorrect password." }, 401);
+      }
+    }
+
+    let itemData = null;
+    let isFolder = false;
+    const baseUrl = $env.APP_URL || "";
+
+    if (shareData.item_id) {
+      const target = await $db.records.get(COLLECTION, Number(shareData.item_id), "added_by");
+      if (!target) return c.json({ error: "Original file no longer exists." }, 404);
+      
+      isFolder = !target.data.is_file;
+      const storageFilename = target.data.physical_file || target.data.metadata?.storage_filename;
+      let downloadUrl = null;
+
+      if (storageFilename && typeof $files?.getSignedUrl === 'function') {
+        downloadUrl = await $files.getSignedUrl(storageFilename, 3600).catch(() => null);
+      }
+
+      const previewData = await generateFilePreview({
+        id: target.id,
+        ...target.data,
+        preview: target.data.preview
+      }, baseUrl);
+
+      let creatorName = "User";
+      if (target.expand?.added_by) {
+        const prof = Array.isArray(target.expand.added_by) ? target.expand.added_by[0] : target.expand.added_by;
+        creatorName = prof?.data?.metadata?.display_name || "User";
+      }
+
+      itemData = {
+        id: String(target.id),
+        file: target.data.file,
+        path: target.data.path,
+        is_file: target.data.is_file,
+        metadata: target.data.metadata || {},
+        preview: previewData,
+        downloadUrl,
+        added_by: creatorName,
+        created: target.created,
+        updated: target.updated
+      };
+    } else if (shareData.folder_path) {
+      isFolder = true;
+      const children = await $db.query({
+        from: COLLECTION,
+        where: { path: shareData.folder_path },
+        limit: 1000
+      });
+      
+      itemData = {
+        file: shareData.folder_path.split('/').filter(Boolean).pop() || "Root Folder",
+        path: shareData.folder_path,
+        is_file: false,
+        children: (children || []).map(c => ({
+          id: String(c.id),
+          file: c.data.file,        // Access via .data
+          is_file: c.data.is_file,  // Access via .data
+          metadata: c.data.metadata || {},
+          updated: c.updated
+        }))
+      };
+    }
+
+    return c.json({
+      success: true,
+      access_level: shareData.access_level,
+      isFolder,
+      item: itemData
+    });
+
+  } catch (e) {
+    return c.json({ status: "error", message: e.message || String(e) }, 500);
+  }
+});
 
 export default async function (req) {
   return app.fetch(req);
