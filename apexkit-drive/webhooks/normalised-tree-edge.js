@@ -1,5 +1,5 @@
-/** @type {import("../apexkit").FileMetadata} */
 export const __fileMetadata__ = {
+  "id": 16,
   "name": "normalised-tree-edge",
   "extension": "js",
   "target_collection": null,
@@ -9,6 +9,9 @@ export const __fileMetadata__ = {
   "active": true,
   "visibility": "private"
 };
+
+/** @type {import("../apexkit").FileMetadata} */
+
 
 import { Hono } from "https://esm.sh/hono";
 import { generateFilePreview } from "@/custom/media-preview";
@@ -1306,6 +1309,108 @@ app.get("/shares/:token", async (c) => {
 
   } catch (e) {
     return c.json({ status: "error", message: e.message || String(e) }, 500);
+  }
+});
+
+// ---------------------------------------------------------
+// 14. Download Folder as ZIP (GET /operations/download-folder)
+// ---------------------------------------------------------
+app.get("/operations/download-folder", async (c) => {
+  try {
+    const folderPath = normalizeFolderPath(c.req.query("path") || "/");
+    const folderName = folderPath === '/' ? 'apex-drive-root' : folderPath.split('/').filter(Boolean).pop() || 'folder';
+
+    // Query all files within this directory and its subdirectories
+    const filesRes = await $db.query({
+      from: COLLECTION,
+      where: { is_file: true, path: { $like: `${folderPath}%` } },
+      limit: 1000
+    });
+
+    const zipPayload = {};
+    for (const f of filesRes) {
+      const physicalFile = f.data.physical_file || f.data.metadata?.storage_filename;
+      if (!physicalFile) continue;
+
+      try {
+        const b64 = await $files.read(physicalFile);
+        const buffer = $util.base64DecodeBuffer(b64);
+        
+        // Reconstruct relative paths inside the zip archive
+        const relativeDir = f.data.path.substring(folderPath.length); // e.g. "subfolder/"
+        const zipPath = relativeDir + f.data.file;
+        zipPayload[zipPath] = new Uint8Array(buffer);
+      } catch (e) {
+        console.warn(`[Zip Engine] Failed to append file ${f.data.file}:`, e);
+      }
+    }
+
+    // Process Zip directly in WebAssembly Memory
+    const zipBase64 = $zip.create(zipPayload);
+    const zipBuffer = $util.base64DecodeBuffer(zipBase64);
+
+    return new Response(zipBuffer, {
+      headers: {
+        "Content-Type": "application/zip",
+        "Content-Disposition": `attachment; filename="${folderName}.zip"`,
+        "Access-Control-Allow-Origin": "*"
+      }
+    });
+  } catch (e) {
+    return c.json({ status: "error", message: e.message || String(e) }, 500);
+  }
+});
+
+// ---------------------------------------------------------
+// 15. Upload from External URL (POST /operations/fetch-url)
+// ---------------------------------------------------------
+app.post("/operations/fetch-url", async (c) => {
+  try {
+    const { url, targetPath } = await c.req.json();
+    if (!url) return c.json({ success: false, message: "URL is required" }, 400);
+
+    const normPath = normalizeFolderPath(targetPath || "/");
+    
+    // Fetch resource directly from Edge (Cloudflare/Deno/V8)
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Failed to fetch URL: HTTP ${res.status}`);
+    
+    const arrayBuf = await res.arrayBuffer();
+    const buffer = new Uint8Array(arrayBuf);
+    
+    // Guess filename and mime
+    let filename = url.split('/').pop().split('?')[0];
+    if (!filename || !filename.includes('.')) filename = `download-${Date.now()}.bin`;
+    const mime = res.headers.get('content-type') || 'application/octet-stream';
+    
+    // Save binary stream to Native Storage
+    const saved = await $files.save(filename, buffer, mime);
+    
+    // Resolve Profile mapping
+    const reqAuthId = c.req.raw?.auth?.id || 1;
+    let profileId = null;
+    try {
+      const profileRes = await $db.records.list("profiles", { filter: { user_id: reqAuthId }, limit: 1 });
+      if (profileRes.items && profileRes.items.length > 0) profileId = Number(profileRes.items[0].id);
+    } catch (_) {}
+
+    // Register Document in Database
+    const dbRecord = await $db.records.create(COLLECTION, {
+      path: normPath,
+      is_file: true,
+      file: saved.filename,
+      physical_file: saved.url.split('/').pop() || saved.filename,
+      metadata: { size: buffer.byteLength, type: mime },
+      configurations: {},
+      added_by: profileId ? [profileId] : []
+    });
+
+    // Update recursively stored folder sizes
+    await adjustAncestorFolderSizes(normPath, buffer.byteLength);
+
+    return c.json({ success: true, file: dbRecord.data });
+  } catch (e) {
+    return c.json({ success: false, message: e.message || String(e) }, 500);
   }
 });
 

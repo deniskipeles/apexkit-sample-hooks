@@ -1,5 +1,5 @@
-/** @type {import("../apexkit").FileMetadata} */
 export const __fileMetadata__ = {
+  "id": 43,
   "name": "file-system",
   "extension": "js",
   "target_collection": null,
@@ -9,6 +9,9 @@ export const __fileMetadata__ = {
   "active": true,
   "visibility": "private"
 };
+
+/** @type {import("../apexkit").FileMetadata} */
+
 
 /**
  * HTTP Webhook: file-system

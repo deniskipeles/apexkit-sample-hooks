@@ -5,21 +5,30 @@
 
 export interface Collections {
   "profiles": {
-    user_id: number | string;
     metadata?: Record<string, any> | any[];
+    user_id: number | string;
   };
   "drive_items": {
+    preview?: Record<string, any> | any[];
     file?: string;
-    configurations?: Record<string, any> | any[];
-    path: string;
-    is_file?: boolean;
     metadata?: Record<string, any> | any[];
+    configurations?: Record<string, any> | any[];
     physical_file?: string;
+    is_file?: boolean;
+    path: string;
     added_by: (number | string)[];
+  };
+  "drive_shares": {
+    item_id?: number;
+    expires_at?: string;
+    token: string;
+    access_level: string;
+    password_hash?: string;
+    folder_path?: string;
   };
 }
 
-export type CollectionName = "profiles" | "drive_items";
+export type CollectionName = "profiles" | "drive_items" | "drive_shares";
 
 export interface CollectionExpands {
   "profiles": {
@@ -27,6 +36,9 @@ export interface CollectionExpands {
   };
   "drive_items": {
     added_by?: Array<{ id: number | string; data: Collections["1"]; created: string; updated: string; expand?: any }>;
+    [reverse_relation: string]: any;
+  };
+  "drive_shares": {
     [reverse_relation: string]: any;
   };
 }
@@ -282,6 +294,7 @@ declare global {
   /** Native Storage & File Engine */
   const $files: {
     read(filename: string): Promise<string>;
+    delete(filenameOrId: string | number): Promise<boolean>;
     save(filename: string, data: string | ArrayBuffer | Uint8Array, mime?: string): Promise<{ id: number | string; url: string; filename: string }>;
     getSignedUrl(filename: string, ttl_secs?: number): Promise<string>;
   };

@@ -527,7 +527,7 @@ export {};
         "@/esm/*": ["./modules/esm/*"]
       },
       allowJs: true,
-      checkJs: false
+      checkJs: true
     },
     include: ["**/*.js", "**/*.ts", "apexkit.d.ts"]
   };

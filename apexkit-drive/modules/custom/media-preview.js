@@ -1,5 +1,5 @@
-/** @type {import("../../apexkit").FileMetadata} */
 export const __fileMetadata__ = {
+  "id": 35,
   "name": "media-preview",
   "extension": "js",
   "target_collection": null,
@@ -9,6 +9,9 @@ export const __fileMetadata__ = {
   "active": true,
   "visibility": "private"
 };
+
+/** @type {import("../../apexkit").FileMetadata} */
+
 
 // Edge-native AST highlighter executing in QuickJS (Zero client dependencies)
 import { highlight } from "https://esm.sh/sugar-high@0.7.0";
