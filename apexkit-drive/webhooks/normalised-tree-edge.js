@@ -338,7 +338,19 @@ app.get("/search", async (c) => {
       limit: 100
     });
 
-    return c.json(res);
+    // FIX: Flatten the output so frontend can access item.file and item.is_file
+    const mapped = res.map(f => {
+      const data = f.data || {};
+      return {
+        id: String(f.id),
+        ...data,
+        path: normalizeFolderPath(data.path),
+        created: f.created,
+        updated: f.updated
+      };
+    });
+
+    return c.json(mapped);
   } catch (e) {
     return c.json({ status: "error", message: e.message || String(e) }, 500);
   }
@@ -450,7 +462,6 @@ app.delete("/files/:id", async (c) => {
       }
     } else {
       const folderPath = itemPath;
-
       const children = await $db.query({
         from: COLLECTION,
         where: {
@@ -468,10 +479,12 @@ app.delete("/files/:id", async (c) => {
 
       for (const child of (children || [])) {
         if (Number(child.id) === id) continue;
-
-        if (child.is_file) {
-          totalDeletedSize += (Number(child.metadata?.size) || 0);
-          const pFile = child.physical_file || child.metadata?.storage_filename;
+        
+        const cData = child.data || {}; // FIX: Access .data
+        
+        if (cData.is_file) {
+          totalDeletedSize += (Number(cData.metadata?.size) || 0);
+          const pFile = cData.physical_file || cData.metadata?.storage_filename;
           if (pFile) {
             physicalFilesToCheck.add(pFile);
           }
@@ -497,6 +510,7 @@ app.delete("/files/:id", async (c) => {
     return c.json({ status: "error", message: e.message || String(e) }, 500);
   }
 });
+
 
 // ---------------------------------------------------------
 // 6. Rename/Move (PATCH /files/:id) - Hardened & Poison-Proof
@@ -533,19 +547,12 @@ app.patch("/files/:id", async (c) => {
       if (finalFileName !== oldName || targetDirectory !== oldPath) {
         const existingCollision = await $db.query({
           from: COLLECTION,
-          where: {
-            path: targetDirectory,
-            file: finalFileName,
-            is_file: true
-          },
+          where: { path: targetDirectory, file: finalFileName, is_file: true },
           limit: 1
         });
 
         if (existingCollision.length > 0 && Number(existingCollision[0].id) !== id) {
-          return c.json({ 
-            success: false, 
-            message: `A file named '${finalFileName}' already exists in '${targetDirectory}'` 
-          }, 409);
+          return c.json({ success: false, message: `A file named '${finalFileName}' already exists in '${targetDirectory}'` }, 409);
         }
       }
 
@@ -580,30 +587,18 @@ app.patch("/files/:id", async (c) => {
       }
 
       if (newFolderFullPath !== currentOldFolderFullPath) {
-        if (
-          newFolderFullPath === currentOldFolderFullPath || 
-          newFolderFullPath.startsWith(currentOldFolderFullPath)
-        ) {
-          return c.json({ 
-            success: false, 
-            message: `Cannot move folder '${oldName}' into its own subfolder` 
-          }, 400);
+        if (newFolderFullPath === currentOldFolderFullPath || newFolderFullPath.startsWith(currentOldFolderFullPath)) {
+          return c.json({ success: false, message: `Cannot move folder '${oldName}' into its own subfolder` }, 400);
         }
 
         const existingFolder = await $db.query({
           from: COLLECTION,
-          where: {
-            path: newFolderFullPath,
-            is_file: false
-          },
+          where: { path: newFolderFullPath, is_file: false },
           limit: 1
         });
 
         if (existingFolder.length > 0 && Number(existingFolder[0].id) !== id) {
-          return c.json({ 
-            success: false, 
-            message: `A folder with path '${newFolderFullPath}' already exists` 
-          }, 409);
+          return c.json({ success: false, message: `A folder with path '${newFolderFullPath}' already exists` }, 409);
         }
       }
 
@@ -624,16 +619,16 @@ app.patch("/files/:id", async (c) => {
 
         const children = await $db.query({
           from: COLLECTION,
-          where: {
-            path: { $like: `${currentOldFolderFullPath}%` }
-          },
+          where: { path: { $like: `${currentOldFolderFullPath}%` } },
           limit: 10000
         });
 
         for (const child of children) {
           if (Number(child.id) === id) continue;
-
-          const childPath = normalizeFolderPath(child.path);
+          
+          const cData = child.data || {}; // FIX: Access .data
+          const childPath = normalizeFolderPath(cData.path);
+          
           if (childPath.startsWith(currentOldFolderFullPath)) {
             const childRelativePath = childPath.substring(currentOldFolderFullPath.length);
             const updatedChildPath = normalizeFolderPath(`${newFolderFullPath}${childRelativePath}`);
@@ -649,6 +644,7 @@ app.patch("/files/:id", async (c) => {
     return c.json({ success: false, message: e.message || String(e) }, 500);
   }
 });
+
 
 // ---------------------------------------------------------
 // 7. Bulk Operations (POST /operations/move & /operations/copy)
@@ -710,7 +706,9 @@ app.post("/operations/move", async (c) => {
           });
 
           for (const child of children) {
-            const childRelativePath = child.path.substring(oldFolderPath.length);
+            const cData = child.data || {}; // FIX: Access .data
+            const childPath = normalizeFolderPath(cData.path);
+            const childRelativePath = childPath.substring(oldFolderPath.length);
             const childNewPath = normalizeFolderPath(`${newFolderPath}${childRelativePath}`);
             await $db.records.update(COLLECTION, Number(child.id), { path: childNewPath });
           }
@@ -805,21 +803,24 @@ app.post("/operations/copy", async (c) => {
 
           for (const child of children) {
             if (Number(child.id) === id) continue;
-            const childRelativePath = child.path.substring(oldFolderPath.length);
+            
+            const cData = child.data || {}; // FIX: Access .data
+            const childPath = normalizeFolderPath(cData.path);
+            const childRelativePath = childPath.substring(oldFolderPath.length);
             const childNewPath = normalizeFolderPath(`${newFolderPath}${childRelativePath}`);
             
             await $db.records.create(COLLECTION, {
               path: childNewPath,
-              is_file: child.is_file,
-              file: child.file,
-              physical_file: child.physical_file,
-              metadata: child.metadata,
-              configurations: child.configurations,
-              added_by: child.added_by
+              is_file: cData.is_file,
+              file: cData.file,
+              physical_file: cData.physical_file,
+              metadata: cData.metadata,
+              configurations: cData.configurations,
+              added_by: cData.added_by
             });
             
-            if (child.is_file) {
-              itemTotalSize += (Number(child.metadata?.size) || 0);
+            if (cData.is_file) {
+              itemTotalSize += (Number(cData.metadata?.size) || 0);
             }
           }
           
