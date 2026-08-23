@@ -24,6 +24,8 @@ const DEFAULT_ROOT_FOLDERS = [
   { name: "Documents", path: "/Documents/", icon: "folder-documents" },
   { name: "Downloads", path: "/Downloads/", icon: "folder-downloads" },
   { name: "Pictures", path: "/Pictures/", icon: "folder-pictures" },
+  { name: "Projects", path: "/Videos/", icon: "folder-videos" },
+  { name: "Projects", path: "/Music/", icon: "folder-music" },
   { name: "Projects", path: "/Projects/", icon: "folder-code" }
 ];
 
@@ -942,16 +944,16 @@ app.get("/preview/:id", async (c) => {
     const target = await $db.records.get(COLLECTION, id, "added_by");
     if (!target) return c.json({ error: "File not found" }, 404);
 
-    const baseUrl = $env.APP_URL || "";
+    const baseUrl = await $env.get("APP_URL") || "";
     const previewData = await generateFilePreview({
       id: target.id,
       ...target.data,
       preview: target.data.preview
     }, baseUrl);
 
-    if (!target.data.preview || Object.keys(target.data.preview).length === 0) {
-      await $db.records.update(COLLECTION, id, { preview: previewData }).catch(() => { });
-    }
+    // if (!target.data.preview || Object.keys(target.data.preview).length === 0) {
+    //   await $db.records.update(COLLECTION, id, { preview: previewData }).catch(() => { });
+    // }
 
     const creatorInfo = getCreatorInfo(target);
 
@@ -969,6 +971,134 @@ app.get("/preview/:id", async (c) => {
     });
   } catch (e) {
     return c.json({ status: "error", message: e.message || String(e) }, 500);
+  }
+});
+
+// ---------------------------------------------------------
+// Fast Image Streaming with Photon, Native Storage Fallback & $fs VFS Cache (GET /preview/:id/:filename)
+// ---------------------------------------------------------
+app.get("/preview/:id/:filename", async (c) => {
+  const id = Number(c.req.param("id"));
+  const filename = c.req.param("filename");
+
+  try {
+    const target = await $db.records.get(COLLECTION, id);
+    if (!target) return c.text("File record not found", 404);
+
+    const storageFilename = target.data?.physical_file || target.data?.metadata?.storage_filename;
+    if (!storageFilename) return c.text("No storage binary linked", 404);
+
+    const vfsCacheDir = "processed_media";
+    const vfsCachedPath = `${vfsCacheDir}/opt_${storageFilename}`;
+
+    // 1. Instant Cache Hit: Serve pre-processed binary directly from $fs VFS
+    if (typeof $fs?.exists === 'function' && await $fs.exists(vfsCachedPath)) {
+      const b64 = typeof $fs.readBytes === 'function' ? await $fs.readBytes(vfsCachedPath) : await $fs.read(vfsCachedPath);
+      const buffer = $util.base64DecodeBuffer(b64);
+
+      return new Response(buffer, {
+        status: 200,
+        headers: {
+          "Content-Type": "image/webp",
+          "Content-Length": String(buffer.byteLength || buffer.length),
+          "Cache-Control": "public, max-age=31536000, immutable",
+          "Access-Control-Allow-Origin": "*"
+        }
+      });
+    }
+
+    // 2. Fetch original binary bytes from Storage
+    const rawBase64 = await $files.read(storageFilename);
+    const arrayBuffer = $util.base64DecodeBuffer(rawBase64);
+    const inputBytes = new Uint8Array(arrayBuffer);
+
+    let outputBytes = null;
+    let mimeType = "image/webp";
+
+    // 3. Attempt in-memory processing via Photon WASM
+    try {
+      const { default: initPhoton, resize, PhotonImage } = await import("https://esm.sh/@silvia-odwyer/photon@0.3.3");
+      await initPhoton("https://esm.sh/@silvia-odwyer/photon@0.3.3/es2022/photon_rs_bg.wasm");
+
+      const img = PhotonImage.new_from_byteslice(inputBytes);
+      const origWidth = img.get_width();
+      const origHeight = img.get_height();
+
+      let processedImg = img;
+      const maxDim = 1920;
+      if (origWidth > maxDim || origHeight > maxDim) {
+        const ratio = Math.min(maxDim / origWidth, maxDim / origHeight);
+        const targetW = Math.round(origWidth * ratio);
+        const targetH = Math.round(origHeight * ratio);
+        processedImg = resize(img, targetW, targetH, 1);
+      }
+
+      const photonBytes = processedImg.get_bytes_jpeg(80);
+
+      if (processedImg !== img) processedImg.free?.();
+      img.free?.();
+
+      // Ensure Photon output actually compressed and did not balloon
+      if (photonBytes && photonBytes.length < inputBytes.length) {
+        outputBytes = photonBytes;
+        mimeType = "image/jpeg";
+      }
+    } catch (photonErr) {
+      console.warn(`[Photon] Processing failed for ${storageFilename}:`, photonErr.message);
+    }
+
+    // 4. Fallback: If Photon failed or ballooned in size, fetch from native backend transformer
+    if (!outputBytes) {
+      try {
+        const localAppUrl = (await $env.get("LOCAL_APP_URL")) || $env.APP_URL || "";
+        const base = localAppUrl.replace(/\/$/, "");
+        const nativeUrl = `${base}/api/v1/storage/file/${storageFilename}?quality=80&format=webp`;
+
+        const fallbackRes = await fetch(nativeUrl);
+        if (fallbackRes.ok) {
+          const ab = await fallbackRes.arrayBuffer();
+          outputBytes = new Uint8Array(ab);
+          mimeType = "image/webp";
+        }
+      } catch (fetchErr) {
+        console.warn(`[Native Fetch Fallback Error]`, fetchErr.message);
+      }
+    }
+
+    // 5. Ultimate Fallback: Serve original raw bytes if both steps fail
+    if (!outputBytes) {
+      outputBytes = inputBytes;
+      mimeType = "application/octet-stream";
+    }
+
+    // 6. Cache the optimized image with $fs for all subsequent requests
+    try {
+      if (typeof $fs?.mkdir === 'function') await $fs.mkdir(vfsCacheDir);
+      const outB64 = $util.base64Encode(outputBytes);
+      if (typeof $fs?.writeBytes === 'function') {
+        await $fs.writeBytes(vfsCachedPath, outB64);
+      } else {
+        if (typeof $fs?.write === 'function') {
+          await $fs.write(vfsCachedPath, outB64);
+        }
+      }
+    } catch (vfsErr) {
+      console.warn(`[VFS Cache Warning] Could not cache ${storageFilename}:`, vfsErr);
+    }
+
+    // 7. Stream optimized binary payload
+    return new Response(outputBytes, {
+      status: 200,
+      headers: {
+        "Content-Type": mimeType,
+        "Content-Length": String(outputBytes.length),
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "Access-Control-Allow-Origin": "*"
+      }
+    });
+  } catch (e) {
+    console.error(`[Image Preview Exception]`, e);
+    return c.text(`Image stream error: ${e.message}`, 500);
   }
 });
 
@@ -1362,7 +1492,7 @@ app.get("/operations/download-folder", async (c) => {
 });
 
 // ---------------------------------------------------------
-// 15. Upload from External URL (POST /operations/fetch-url)
+// 15. Upload from External URL with Smart Extension Detection (POST /operations/fetch-url)
 // ---------------------------------------------------------
 app.post("/operations/fetch-url", async (c) => {
   try {
@@ -1371,22 +1501,83 @@ app.post("/operations/fetch-url", async (c) => {
 
     const normPath = normalizeFolderPath(targetPath || "/");
     
-    // Fetch resource directly from Edge (Cloudflare/Deno/V8)
+    // 1. Fetch remote resource
     const res = await fetch(url);
     if (!res.ok) throw new Error(`Failed to fetch URL: HTTP ${res.status}`);
     
     const arrayBuf = await res.arrayBuffer();
     const buffer = new Uint8Array(arrayBuf);
     
-    // Guess filename and mime
-    let filename = url.split('/').pop().split('?')[0];
-    if (!filename || !filename.includes('.')) filename = `download-${Date.now()}.bin`;
-    const mime = res.headers.get('content-type') || 'application/octet-stream';
+    // 2. MIME to Extension Dictionary
+    const MIME_MAP = {
+      'image/jpeg': 'jpg',
+      'image/jpg': 'jpg',
+      'image/png': 'png',
+      'image/webp': 'webp',
+      'image/gif': 'gif',
+      'image/svg+xml': 'svg',
+      'image/avif': 'avif',
+      'image/bmp': 'bmp',
+      'image/x-icon': 'ico',
+      'application/pdf': 'pdf',
+      'audio/mpeg': 'mp3',
+      'audio/mp3': 'mp3',
+      'audio/wav': 'wav',
+      'audio/ogg': 'ogg',
+      'video/mp4': 'mp4',
+      'video/webm': 'webm',
+      'application/zip': 'zip',
+      'application/x-zip-compressed': 'zip',
+      'application/json': 'json',
+      'text/plain': 'txt'
+    };
+
+    const contentType = (res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+    const contentDisposition = res.headers.get('content-disposition') || '';
+
+    let filename = '';
+    let ext = '';
+
+    // Step A: Check Content-Disposition header
+    const dispMatch = contentDisposition.match(/filename\*?=(?:UTF-8'')?["']?([^"';\n]+)["']?/i);
+    if (dispMatch && dispMatch[1]) {
+      filename = decodeURIComponent(dispMatch[1].trim());
+    }
+
+    // Step B: Parse URL path and query parameters (handles Unsplash ?fm=jpg)
+    if (!filename) {
+      try {
+        const urlObj = new URL(url);
+        const rawBase = urlObj.pathname.split('/').filter(Boolean).pop() || '';
+        const fmParam = urlObj.searchParams.get('fm') || urlObj.searchParams.get('format') || urlObj.searchParams.get('ext');
+
+        if (rawBase.includes('.')) {
+          filename = decodeURIComponent(rawBase);
+        } else {
+          filename = rawBase || `image-${Date.now()}`;
+          if (fmParam) ext = fmParam.toLowerCase();
+        }
+      } catch (_) {
+        filename = `download-${Date.now()}`;
+      }
+    }
+
+    // Step C: Fallback extension from Content-Type if still missing
+    if (!ext && MIME_MAP[contentType]) {
+      ext = MIME_MAP[contentType];
+    }
+
+    // Step D: Ensure filename ends with an extension
+    if (!filename.includes('.')) {
+      filename = `${filename}.${ext || 'jpg'}`;
+    }
+
+    const mime = contentType || 'application/octet-stream';
     
-    // Save binary stream to Native Storage
+    // 3. Save binary to Storage
     const saved = await $files.save(filename, buffer, mime);
     
-    // Resolve Profile mapping
+    // 4. Resolve Profile mapping
     const reqAuthId = c.req.raw?.auth?.id || 1;
     let profileId = null;
     try {
@@ -1394,18 +1585,18 @@ app.post("/operations/fetch-url", async (c) => {
       if (profileRes.items && profileRes.items.length > 0) profileId = Number(profileRes.items[0].id);
     } catch (_) {}
 
-    // Register Document in Database
+    // 5. Register in drive_items database collection
     const dbRecord = await $db.records.create(COLLECTION, {
       path: normPath,
       is_file: true,
-      file: saved.filename,
-      physical_file: saved.url.split('/').pop() || saved.filename,
+      file: filename,
+      physical_file: saved.url ? saved.url.split('/').pop() : saved.filename,
       metadata: { size: buffer.byteLength, type: mime },
       configurations: {},
       added_by: profileId ? [profileId] : []
     });
 
-    // Update recursively stored folder sizes
+    // 6. Adjust directory sizes
     await adjustAncestorFolderSizes(normPath, buffer.byteLength);
 
     return c.json({ success: true, file: dbRecord.data });

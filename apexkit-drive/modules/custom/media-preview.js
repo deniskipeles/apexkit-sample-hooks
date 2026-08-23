@@ -77,9 +77,9 @@ function renderAstHighlightedHtml(rawText, ext) {
  */
 export async function generateFilePreview(fileRecord, baseUrl = '') {
   // Return cached preview if present
-  if (fileRecord.preview && Object.keys(fileRecord.preview).length > 0) {
-    return fileRecord.preview;
-  }
+  // if (fileRecord.preview && Object.keys(fileRecord.preview).length > 0) {
+  //   return fileRecord.preview;
+  // }
 
   const filename = fileRecord.file;
   const storageFilename = fileRecord.physical_file || fileRecord.metadata?.storage_filename;
@@ -112,9 +112,9 @@ export async function generateFilePreview(fileRecord, baseUrl = '') {
       result.htmlContent = renderAstHighlightedHtml(rawText, ext);
     }
 
-    // --- 2. VIDEO / IMAGES: Native Storage + WASM ---
+    // --- 2. VIDEO / IMAGES: Streamed binary URL (No bulky Base64 in JSON payload) ---
     else if (category === 'image') {
-      result.thumbnail = `${baseUrl}/api/v1/storage/file/${storageFilename}?thumb=400x400&format=webp`;
+      result.thumbnail = `${baseUrl}/api/v1/webhook/normalised-tree-edge/preview/${fileRecord.id}/${encodeURIComponent(filename)}`;
     }
 
     // --- 3. ARCHIVES: Fast In-Memory WASM ZIP Inspection ---
