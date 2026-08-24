@@ -1,0 +1,7 @@
+{
+  "name": "apexkit-workspace",
+  "type": "module",
+  "scope": "tenant:vortex",
+  "__track__": false,
+  "dependencies": {}
+}
