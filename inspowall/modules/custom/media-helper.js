@@ -1,23 +1,50 @@
-/** @type {import("../apexkit").FileMetadata} */
+/** @type {import("../../apexkit").FileMetadata} */
 export const __fileMetadata__ = {
-  "id": 23,
   "name": "media-helper",
   "extension": "js",
   "target_collection": null,
   "type": "custom:module",
   "path": "./modules/custom/",
-  "trigger_type": "manually",
   "active": true,
   "visibility": "private"
 };
 
-/** @type {import("../../apexkit").FileMetadata} */
-
-
 const VFS_MEDIA_DIR = "processed_media";
 
+function inspectMagicBytes(bytes) {
+  if (!bytes || bytes.length < 12) return { valid: false, mime: "application/octet-stream" };
+
+  // JPEG
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return { valid: true, mime: "image/jpeg" };
+  }
+  // PNG
+  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+    return { valid: true, mime: "image/png" };
+  }
+  // WebP
+  if (
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
+  ) {
+    return { valid: true, mime: "image/webp" };
+  }
+  // GIF
+  if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) {
+    return { valid: true, mime: "image/gif" };
+  }
+
+  return { valid: false, mime: "application/octet-stream" };
+}
+
 /**
- * Checks and reads an optimized image directly from $fs VFS
+ * Checks and reads an image from $fs VFS, automatically purging corrupted files
  */
 export async function getCachedMedia(cacheKey) {
   const vfsPath = `${VFS_MEDIA_DIR}/${cacheKey}`;
@@ -26,23 +53,47 @@ export async function getCachedMedia(cacheKey) {
       typeof $fs.readBytes === "function"
         ? await $fs.readBytes(vfsPath)
         : await $fs.read(vfsPath);
-    return $util.base64DecodeBuffer(b64);
+
+    if (b64) {
+      const buffer = $util.base64DecodeBuffer(b64);
+      const uint8 = new Uint8Array(buffer);
+      const check = inspectMagicBytes(uint8);
+
+      // If magic bytes are valid, return the clean buffer
+      if (check.valid && buffer.byteLength >= 2048) {
+        return { buffer, mimeType: check.mime };
+      } else {
+        // Auto-purge corrupted cache file
+        console.warn(`[VFS Cache] Purging corrupted or incomplete file: ${cacheKey}`);
+        if (typeof $fs?.delete === "function") {
+          await $fs.delete(vfsPath);
+        }
+      }
+    }
   }
   return null;
 }
 
 /**
- * Saves processed image bytes to $fs VFS
+ * Saves processed image bytes to $fs VFS only if valid
  */
 export async function saveCachedMedia(cacheKey, arrayBuffer) {
   try {
+    const uint8 = new Uint8Array(arrayBuffer);
+    const check = inspectMagicBytes(uint8);
+
+    if (!check.valid || arrayBuffer.byteLength < 2048) {
+      console.warn(`[VFS Cache] Skipping save for invalid or small binary: ${cacheKey}`);
+      return;
+    }
+
     if (typeof $fs?.mkdir === "function") await $fs.mkdir(VFS_MEDIA_DIR);
     const vfsPath = `${VFS_MEDIA_DIR}/${cacheKey}`;
-    const b64 = $util.base64EncodeBuffer(arrayBuffer);
 
     if (typeof $fs?.writeBytes === "function") {
-      await $fs.writeBytes(vfsPath, b64);
+      await $fs.writeBytes(vfsPath, arrayBuffer);
     } else if (typeof $fs?.write === "function") {
+      const b64 = $util.base64EncodeBuffer(arrayBuffer);
       await $fs.write(vfsPath, b64);
     }
   } catch (e) {
@@ -51,123 +102,58 @@ export async function saveCachedMedia(cacheKey, arrayBuffer) {
 }
 
 /**
- * Resolves, compresses, and caches any storage image
+ * Resolves, transforms via Native Backend Engine to WebP, and caches into $fs VFS
  */
 export async function processAndCacheImage(storageFilename, options = {}) {
-  const thumb = options.thumb || "orig";
-  const quality = Math.min(Math.max(Number(options.quality) || 80, 10), 100);
+  const thumb = options.thumb || "";
+  const quality = options.quality || "80";
   const format = (options.format || "webp").toLowerCase();
+  const blur = options.blur || "";
 
   const safeFilename = storageFilename.replace(/[^a-zA-Z0-9._-]/g, "_");
-  const cacheKey = `opt_${safeFilename}_${thumb}_q${quality}.${format}`;
+  const cacheKey = `opt_${safeFilename}_t${thumb || "orig"}_q${quality}_b${blur || "0"}.${format}`;
 
-  // 1. Instant Cache Hit from $fs
-  const cachedBuffer = await getCachedMedia(cacheKey);
-  if (cachedBuffer) {
+  // 1. Check VFS Cache (with automatic corruption purge)
+  const cached = await getCachedMedia(cacheKey);
+  if (cached) {
     return {
-      buffer: cachedBuffer,
-      mimeType: format === "jpeg" || format === "jpg" ? "image/jpeg" : format === "png" ? "image/png" : "image/webp",
-      hit: true
+      buffer: cached.buffer,
+      mimeType: cached.mimeType,
+      hit: true,
     };
   }
 
-  // 2. Fetch original binary bytes from Storage
-  let inputBytes = null;
-  try {
-    const rawB64 = await $files.read(storageFilename);
-    const ab = $util.base64DecodeBuffer(rawB64);
-    inputBytes = new Uint8Array(ab);
-  } catch (e) {
-    throw new Error(`File '${storageFilename}' not found in storage: ${e.message}`);
+  // 2. Cache Miss: Transform directly via native backend image engine (forcing WebP)
+  const localAppUrl = (await $env.get("LOCAL_APP_URL")) || "http://127.0.0.1:5000";
+  const cleanBase = localAppUrl.replace(/\/$/, "");
+
+  const qs = new URLSearchParams();
+  if (thumb && thumb !== "orig") qs.set("thumb", thumb);
+  qs.set("format", format);
+  qs.set("quality", quality);
+  if (blur) qs.set("blur", blur);
+
+  const nativeUrl = `${cleanBase}/api/v1/storage/file/${encodeURIComponent(storageFilename)}?${qs.toString()}`;
+
+  const res = await fetch(nativeUrl);
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`Native transform failed [${res.status}]: ${errText || res.statusText}`);
   }
 
-  let outputBytes = null;
-  let mimeType = format === "jpeg" || format === "jpg" ? "image/jpeg" : "image/webp";
+  const ab = await res.arrayBuffer();
+  const check = inspectMagicBytes(new Uint8Array(ab));
 
-  // 3. In-memory processing via Photon WASM
-  try {
-    const { default: initPhoton, resize, PhotonImage } = await import(
-      "https://esm.sh/@silvia-odwyer/photon@0.3.3"
-    );
-    await initPhoton("https://esm.sh/@silvia-odwyer/photon@0.3.3/es2022/photon_rs_bg.wasm");
-
-    const img = PhotonImage.new_from_byteslice(inputBytes);
-    const origWidth = img.get_width();
-    const origHeight = img.get_height();
-
-    let targetW = origWidth;
-    let targetH = origHeight;
-
-    if (thumb && thumb !== "orig") {
-      const [wStr, hStr] = thumb.split("x");
-      const reqW = parseInt(wStr, 10) || 0;
-      const reqH = parseInt(hStr, 10) || 0;
-
-      if (reqW > 0 && reqH > 0) {
-        targetW = reqW;
-        targetH = reqH;
-      } else if (reqW > 0) {
-        const ratio = reqW / origWidth;
-        targetW = reqW;
-        targetH = Math.round(origHeight * ratio);
-      } else if (reqH > 0) {
-        const ratio = reqH / origHeight;
-        targetH = reqH;
-        targetW = Math.round(origWidth * ratio);
-      }
-    }
-
-    let processedImg = img;
-    if (targetW !== origWidth || targetH !== origHeight) {
-      processedImg = resize(img, targetW, targetH, 1);
-    }
-
-    const photonBytes = processedImg.get_bytes_jpeg(quality);
-
-    if (processedImg !== img) processedImg.free?.();
-    img.free?.();
-
-    if (photonBytes && photonBytes.length > 0) {
-      outputBytes = photonBytes;
-      mimeType = "image/jpeg";
-    }
-  } catch (photonErr) {
-    console.warn(`[Photon] WASM processing skipped for ${storageFilename}:`, photonErr.message);
+  if (!check.valid) {
+    throw new Error("Native engine returned invalid image magic bytes");
   }
 
-  // 4. Native Engine Fallback if Photon fails
-  if (!outputBytes) {
-    try {
-      const localAppUrl = (await $env.get("LOCAL_APP_URL")) || "http://127.0.0.1:5000";
-      const nativeUrl = `${localAppUrl.replace(/\/$/, "")}/api/v1/storage/file/${storageFilename}?thumb=${thumb}&quality=${quality}&format=${format}`;
-
-      const fallbackRes = await fetch(nativeUrl);
-      if (fallbackRes.ok) {
-        const ab = await fallbackRes.arrayBuffer();
-        outputBytes = new Uint8Array(ab);
-        mimeType = fallbackRes.headers.get("content-type") || mimeType;
-      }
-    } catch (fetchErr) {
-      console.warn(`[Native Fallback] Could not fetch native transform:`, fetchErr.message);
-    }
-  }
-
-  // 5. Ultimate Fallback: Original Bytes
-  if (!outputBytes) {
-    outputBytes = inputBytes;
-    mimeType = "application/octet-stream";
-  }
-
-  // 6. Cache into $fs for all future requests
-  const finalBuffer = outputBytes.buffer.slice(
-    outputBytes.byteOffset,
-    outputBytes.byteOffset + outputBytes.byteLength
-  );
-  await saveCachedMedia(cacheKey, finalBuffer);
+  // 3. Cache the verified binary in $fs for future requests
+  await saveCachedMedia(cacheKey, ab);
 
   return {
-    buffer: finalBuffer,
-    mimeType,
-    hit: false
+    buffer: ab,
+    mimeType: check.mime,
+    hit: false,
   };
 }

@@ -1,9 +1,6 @@
-/** @type {import("../apexkit").FileMetadata} */
 export const __fileMetadata__ = {
-  "id": 15,
   "name": "og",
   "extension": "js",
-  "target_collection": null,
   "type": "webhook",
   "path": "./webhooks/",
   "trigger_type": "manual",
@@ -53,13 +50,17 @@ app.post("/store", async (c) => {
   const hashPayload = `${finalTemplateId}:${imgFormat}:${imgQuality}:${JSON.stringify(processedData)}`;
   const hash = $util.hash(hashPayload, "sha256").substring(0, 24);
 
-  // Extract individual fields to satisfy og_configs required schema constraints
   const firstImage = processedData.find(d => d.type === "image");
   const titleVar = processedData.find(d => d.target === "TITLE");
   const subtitleVar = processedData.find(d => d.target === "SUBTITLE");
   const siteVar = processedData.find(d => d.target === "SITE_NAME");
   const photographerVar = processedData.find(d => d.target === "PHOTOGRAPHER");
   const platformVar = processedData.find(d => d.target === "PLATFORM");
+  
+  let safePlatform = (platformVar?.value || "inspowall").toLowerCase();
+  if (!["unsplash", "pexels", "inspowall"].includes(safePlatform)) {
+      safePlatform = "inspowall";
+  }
 
   const configData = {
     hash,
@@ -67,23 +68,23 @@ app.post("/store", async (c) => {
     format: imgFormat,
     quality: String(imgQuality),
     saved_filename: firstImage?.value || "default",
-    platform: (platformVar?.value || "inspowall").toLowerCase(),
+    platform: safePlatform,
     title_line_1: titleVar?.value || "",
     subtitle: subtitleVar?.value || "",
     site_name: siteVar?.value || "",
-    photographer: photographerVar?.value || "",
-    data_payload: processedData,
-    api_key_id: String(keyRecord?.id || "0")
+    photographer: photographerVar?.value || ""
   };
 
-  // 1. Immediately cache in $cache so resolution always succeeds
+  if (keyRecord && keyRecord.id) {
+      configData.api_key_id = keyRecord.id;
+  }
+
   try {
-    await $cache.set(`og_hash:${hash}`, JSON.stringify(configData), 31536000);
+    await $cache.set(`og_hash:${hash}`, JSON.stringify({ ...configData, data_payload: processedData }), 31536000);
   } catch (e) {
     console.error("[OG Store] Cache set failed:", e);
   }
 
-  // 2. Persist in DB
   try {
     const existing = await $db.records.list("og_configs", { filter: JSON.stringify({ hash }) });
     if (existing?.items?.length > 0) {
@@ -92,7 +93,7 @@ app.post("/store", async (c) => {
       await $db.records.create("og_configs", configData);
     }
   } catch (e) {
-    console.error("[OG Store] DB save failed (check og_configs schema constraints):", e);
+    console.error("[OG Store] DB save failed:", e);
   }
 
   return c.json({ success: true, hash, format: imgFormat });
@@ -107,15 +108,16 @@ app.get("/image/:hash", async (c) => {
 
   if (!hash) return c.json({ error: "Missing hash" }, 400);
 
-  // A. Check Local VFS Cache First (Ultra Fast)
+  // A. Check Local VFS Cache First
   try {
     const cachedBuffer = await getCachedOgImage(hash);
     if (cachedBuffer) {
+      const isCacheable = cachedBuffer.byteLength >= 2048;
       return new Response(cachedBuffer, {
         status: 200,
         headers: {
           "Content-Type": "image/webp",
-          "Cache-Control": "public, max-age=31536000, immutable"
+          "Cache-Control": isCacheable ? "public, max-age=31536000, immutable" : "no-store, max-age=0"
         }
       });
     }
@@ -147,11 +149,12 @@ app.get("/image/:hash", async (c) => {
   }
 
   if (!configData) {
-    console.error(`[OG Image] Configuration not found for hash: ${hash}`);
-    return c.json({ error: "OpenGraph configuration not found" }, 404);
+    return new Response(JSON.stringify({ error: "OpenGraph configuration not found" }), {
+      status: 404,
+      headers: { "Content-Type": "application/json", "Cache-Control": "no-store, max-age=0" }
+    });
   }
 
-  // Reconstruct payload for the rendering engine
   let ogData = [];
   if (Array.isArray(configData.data_payload)) {
     ogData = configData.data_payload.map(item => {
@@ -166,7 +169,6 @@ app.get("/image/:hash", async (c) => {
       return item;
     });
   } else {
-    // Fallback for legacy DB records
     ogData = [
       { type: "image", target: "IMAGE_URL", value: configData.saved_filename || "" },
       { type: "text", target: "TITLE", value: configData.title_line_1 || "" },
@@ -184,24 +186,27 @@ app.get("/image/:hash", async (c) => {
   const encodedData = encodeURIComponent(JSON.stringify(ogData));
   const renderUrl = `${localAppUrl.replace(/\/$/, '')}/api/v1/storage/files/opengraph?template=${configData.template_id || "default-opengraph"}&data=${encodedData}&format=${format}&quality=${quality}`;
 
-  // C. Fetch generated image from the core engine
   const res = await fetch(renderUrl);
   if (!res.ok) {
     const errText = await res.text();
-    console.error("[OG Image] Engine render error:", errText);
-    return c.text(`Internal Rendering Error: ${errText}`, 502);
+    return new Response(`Internal Rendering Error: ${errText}`, {
+      status: 502,
+      headers: { "Cache-Control": "no-store, max-age=0" }
+    });
   }
 
   const ab = await res.arrayBuffer();
+  const isCacheable = ab.byteLength >= 2048;
 
-  // D. Save to VFS Cache for future requests
-  await cacheOgImage(hash, ab);
+  if (isCacheable) {
+    await cacheOgImage(hash, ab);
+  }
 
   return new Response(ab, {
     status: 200,
     headers: {
       "Content-Type": res.headers.get("content-type") || "image/webp",
-      "Cache-Control": "public, max-age=31536000, immutable"
+      "Cache-Control": isCacheable ? "public, max-age=31536000, immutable" : "no-store, max-age=0"
     }
   });
 });
